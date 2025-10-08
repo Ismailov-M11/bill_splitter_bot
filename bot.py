@@ -12,6 +12,7 @@ from telegram import (
     KeyboardButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    WebAppInfo,  # ← добавили
 )
 from telegram.ext import (
     Application,
@@ -24,6 +25,7 @@ from telegram.ext import (
 
 # ================== CONFIG & LOGGING ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8388611917:AAEL-NwaqhEBlQFT_waK5iwy3ehiydBZgbU")
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://bill-splitter-bot.netlify.app/")  # ← добавили
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -79,6 +81,12 @@ def kb_main():
             [KeyboardButton("🍽 Назначить"), KeyboardButton("⚙️ Сервис"), KeyboardButton("🧮 Рассчитать")],
         ],
         resize_keyboard=True,
+    )
+
+def kb_open_webapp() -> InlineKeyboardMarkup:
+    """Кнопка открытия WebApp."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("💻 Открыть Web App", web_app=WebAppInfo(url=WEBAPP_URL))]]
     )
 
 def parse_dish_freeform(text: str) -> Tuple[str, Decimal, Decimal]:
@@ -148,9 +156,23 @@ def summarize_choices_for_person(bill: Bill, p_idx: int) -> str:
 
 # ================== COMMANDS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 1) отправляем кнопку "Open Web App"
     await update.message.reply_text(
-        "👋 Добро пожаловать! Я помогу корректно разделить счёт. Пожалуйста, используйте кнопки ниже.",
+        "👋 Добро пожаловать в Bill Splitter Bot!\n"
+        "Нажмите кнопку ниже, чтобы открыть мини-приложение:",
+        reply_markup=kb_open_webapp()
+    )
+    # 2) следом отправляем вашу обычную клавиатуру
+    await update.message.reply_text(
+        "Или используйте клавиатуру ниже для работы внутри чата:",
         reply_markup=kb_main()
+    )
+
+# Доп. команда на случай, если пользователь напишет /open
+async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Откройте Web App по кнопке ниже:",
+        reply_markup=kb_open_webapp()
     )
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -381,6 +403,7 @@ def main():
         raise RuntimeError("Пожалуйста, задайте BOT_TOKEN в переменной окружения или пропишите его прямо в коде.")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("open", cmd_open))   # ← добавили
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CallbackQueryHandler(on_callback))
     log.info("Бот запущен (polling). LOG_LEVEL=%s", LOG_LEVEL)
