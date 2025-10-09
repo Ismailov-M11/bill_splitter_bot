@@ -1,6 +1,7 @@
 # bot.py
 import os
 import re
+import json
 import logging
 from decimal import Decimal, ROUND_HALF_UP
 from dataclasses import dataclass, field
@@ -10,9 +11,9 @@ from telegram import (
     Update,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    WebAppInfo,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    WebAppInfo,  # ← добавили
 )
 from telegram.ext import (
     Application,
@@ -25,7 +26,8 @@ from telegram.ext import (
 
 # ================== CONFIG & LOGGING ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8388611917:AAEL-NwaqhEBlQFT_waK5iwy3ehiydBZgbU")
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://bill-splitter-bot.netlify.app/")  # ← добавили
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://bill-splitter-bot.netlify.app/")
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -66,7 +68,7 @@ class Bill:
             if need > 0:
                 d.assigned.extend([Decimal(0)] * need)
 
-# чат -> состояние
+# чат -> состояние (для режима через меню бота)
 STATE: Dict[int, Bill] = {}
 
 # ================== HELPERS ==================
@@ -75,18 +77,14 @@ def fmt_money(n: int | Decimal) -> str:
     return f"{n:,}".replace(",", " ")
 
 def kb_main():
+    # добавляем кнопку открытия WebApp прямо в чат
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("🧾 Новый счёт"), KeyboardButton("➕ Блюдо"), KeyboardButton("👤 Участник")],
             [KeyboardButton("🍽 Назначить"), KeyboardButton("⚙️ Сервис"), KeyboardButton("🧮 Рассчитать")],
+            [KeyboardButton("🧮 Open (WebApp)", web_app=WebAppInfo(url=WEBAPP_URL))],
         ],
         resize_keyboard=True,
-    )
-
-def kb_open_webapp() -> InlineKeyboardMarkup:
-    """Кнопка открытия WebApp."""
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("💻 Открыть Web App", web_app=WebAppInfo(url=WEBAPP_URL))]]
     )
 
 def parse_dish_freeform(text: str) -> Tuple[str, Decimal, Decimal]:
@@ -156,23 +154,9 @@ def summarize_choices_for_person(bill: Bill, p_idx: int) -> str:
 
 # ================== COMMANDS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 1) отправляем кнопку "Open Web App"
     await update.message.reply_text(
-        "👋 Добро пожаловать в Bill Splitter Bot!\n"
-        "Нажмите кнопку ниже, чтобы открыть мини-приложение:",
-        reply_markup=kb_open_webapp()
-    )
-    # 2) следом отправляем вашу обычную клавиатуру
-    await update.message.reply_text(
-        "Или используйте клавиатуру ниже для работы внутри чата:",
+        "👋 Добро пожаловать! Вы можете ввести счёт вручную или открыть WebApp (кнопка ниже).",
         reply_markup=kb_main()
-    )
-
-# Доп. команда на случай, если пользователь напишет /open
-async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Откройте Web App по кнопке ниже:",
-        reply_markup=kb_open_webapp()
     )
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -289,7 +273,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Не удалось распознать команду. Пожалуйста, используйте кнопки ниже.", reply_markup=kb_main())
 
-# ================== CALLBACKS ==================
+# ================== CALLBACKS (меню бота) ==================
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -348,7 +332,7 @@ async def show_assign_screen(update: Update, bill: Bill, p_idx: int, flash: str 
         reply_markup=build_assign_keyboard(bill, p_idx)
     )
 
-# ================== SUMMARY ==================
+# ================== SUMMARY (для режима меню бота) ==================
 def compute_summary_details(bill: Bill):
     n = max(1, len(bill.people))
     per_person = [Decimal(0)] * n
@@ -397,15 +381,68 @@ async def send_summary(update: Update, bill: Bill):
         )
     await update.message.reply_text("\n".join(lines), reply_markup=kb_main())
 
+# ================== HANDLER ДАННЫХ ИЗ WEBAPP ==================
+def _format_webapp_message(data: dict) -> str:
+    """Форматируем сообщение строго по заданному шаблону."""
+    def g(key, default=0):
+        return int(data.get(key, default))
+
+    base_total   = g("base_total")
+    service_pct  = int(data.get("service_pct", 0))
+    service_total= g("service_total")
+    total        = g("total")
+
+    lines = [
+        "🧮 Итоговый расчёт:",
+        f"Без сервиса: {fmt_money(base_total)} {UZS}",
+        f"Сервис {service_pct}%: {fmt_money(service_total)} {UZS}",
+        f"💰 Итого: {fmt_money(total)} {UZS}",
+        "",
+        "👥 Разбивка по участникам:",
+    ]
+
+    people = data.get("people", [])
+    for idx, p in enumerate(people, start=1):
+        name    = p.get("name", f"Участник {idx}")
+        base    = int(p.get("base", 0))
+        svc     = int(p.get("service", 0))
+        p_total = int(p.get("total", base + svc))
+        lines.append(
+            f"{idx}. {name} — {fmt_money(p_total)} {UZS}  "
+            f"(до сервиса: {fmt_money(base)} {UZS}, +{fmt_money(svc)} {UZS})"
+        )
+
+    return "\n".join(lines)
+
+async def on_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатываем данные, которые пришли из WebApp через Telegram.WebApp.sendData(JSON).
+    Эти данные автоматически привязаны к текущему пользователю: сообщение уходит в тот же чат.
+    """
+    wad = update.message.web_app_data  # type: ignore[attr-defined]
+    if not wad:
+        return
+
+    try:
+        data = json.loads(wad.data or "{}")
+    except Exception as e:
+        log.exception("Bad web_app_data JSON: %s", e)
+        await update.message.reply_text("Не удалось прочитать итог из WebApp.", reply_markup=kb_main())
+        return
+
+    text = _format_webapp_message(data)
+    await update.message.reply_text(text, reply_markup=kb_main())
+
 # ================== BOOT ==================
 def main():
-    if BOT_TOKEN == "PASTE_YOUR_TOKEN_HERE":
-        raise RuntimeError("Пожалуйста, задайте BOT_TOKEN в переменной окружения или пропишите его прямо в коде.")
+    # базовая логика бота (меню и web-app data) — на polling
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("open", cmd_open))   # ← добавили
+    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_web_app_data))  # из WebApp
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CallbackQueryHandler(on_callback))
+
     log.info("Бот запущен (polling). LOG_LEVEL=%s", LOG_LEVEL)
     app.run_polling(close_loop=False)
 
