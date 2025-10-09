@@ -158,6 +158,20 @@ def summarize_choices_for_person(bill: Bill, p_idx: int) -> str:
         return "—"
     return "\n".join(lines)
 
+def calc_base_total(bill: Bill) -> Decimal:
+    return sum((d.line_total for d in bill.dishes), start=Decimal(0))
+
+def render_dishes_lines(bill: Bill) -> str:
+    if not bill.dishes:
+        return "Нет добавленных блюд"
+    lines = []
+    for i, d in enumerate(bill.dishes, start=1):
+        qty_i = int(d.qty_total)
+        unit_i = int(d.unit_price)
+        sum_i = int(d.line_total)
+        lines.append(f"{i}. {d.name} — {qty_i} шт × {fmt_money(unit_i)} {UZS} = {fmt_money(sum_i)} {UZS}")
+    return "\n".join(lines)
+
 # ================== COMMANDS / MENU ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -182,7 +196,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "⚙️ Сервис":
         context.user_data["mode"] = "svc"
         await update.message.reply_text(
-            "Введите процент сервиса (целое число):",
+            "Пожалуйста, введите процент сервиса (целое число):",
             reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Отмена")]], resize_keyboard=True),
         )
         return
@@ -198,9 +212,24 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text("Только число от 0 до 100, пожалуйста.")
             return
+
         bill.service_pct = Decimal(pct)
         context.user_data.pop("mode", None)
-        await update.message.reply_text(f"Процент сервиса установлен: {pct}%", reply_markup=kb_main())
+
+        # Сводка после установки сервиса
+        base_total = calc_base_total(bill)
+        service_total = (base_total * bill.service_pct / Decimal(100)).quantize(Q2, rounding=ROUND_HALF_UP)
+        total = base_total + service_total
+
+        dishes_block = render_dishes_lines(bill)
+        msg = (
+            f"✅ Процент сервиса установлен: {pct}%\n\n"
+            f"📋 Список блюд:\n{dishes_block}\n\n"
+            f"🧮 Итого без сервиса: {fmt_money(base_total)} {UZS}\n"
+            f"🧾 Сервис {pct}%: {fmt_money(service_total)} {UZS}\n"
+            f"💰 Итого к оплате: {fmt_money(total)} {UZS}"
+        )
+        await update.message.reply_text(msg, reply_markup=kb_main())
         return
 
     if text == "➕ Блюдо":
@@ -222,16 +251,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(str(e))
             return
+
         d = Dish(name=name, qty_total=qty, line_total=line_total)
         d.assigned = [Decimal(0)] * len(bill.people)
         bill.dishes.append(d)
 
-        items = "\n".join([f"{i+1}. {x.name} — {int(x.qty_total)} шт" for i, x in enumerate(bill.dishes)])
-        await update.message.reply_text(
-            f"✅ Блюдо добавлено: {name} — {int(qty)} шт\n\n"
-            f"📋 Список блюд:\n{items}",
-            reply_markup=kb_main()
+        # >>> ВАЖНО: сбрасываем режим после успешного добавления
+        context.user_data.pop("mode", None)
+
+        # Формируем красивую сводку: список с ценами и общая сумма
+        dishes_block = render_dishes_lines(bill)
+        base_total = calc_base_total(bill)
+        msg = (
+            f"✅ Блюдо добавлено: {name} — {int(qty)} шт × {fmt_money(int(d.unit_price))} {UZS} = {fmt_money(int(line_total))} {UZS}\n\n"
+            f"📋 Список блюд:\n{dishes_block}\n\n"
+            f"🧮 Общая сумма без сервиса: {fmt_money(base_total)} {UZS}"
         )
+        await update.message.reply_text(msg, reply_markup=kb_main())
         return
 
     if text == "👤 Участник":
@@ -368,20 +404,19 @@ async def show_assign_screen(update: Update, bill: Bill, p_idx: int, flash: str 
 def _format_webapp_message(data: dict) -> str:
     """
     Понимаем ОБА формата:
-    A) «Legacy» (который бот ждал раньше):
+    A) «Legacy»:
        {
          base_total, service_pct, service_total, total,
          people: [{name, base, service, total}, ...]
        }
-    B) «Builder WebApp» (то, что сейчас отправляет фронт):
+    B) «Builder WebApp»:
        {
          type: "calculation",
          servicePercent,
-         participants: [{id, name, amount}],   # сумма уже с сервисом
-         dishes: [{name, qty, totalPrice, assignments: [participantId|null, ...]}, ...],
+         participants: [{id, name, amount}],
+         dishes: [{name, qty, totalPrice, assignments: [...]}, ...],
          total
        }
-    В случае B пересчитываем базу/сервис на каждое лицо, исходя из dishes+assignments.
     """
 
     # --- Случай A (legacy) ---
@@ -415,15 +450,11 @@ def _format_webapp_message(data: dict) -> str:
         return "\n".join(lines)
 
     # --- Случай B (Builder WebApp) ---
-    # ожидаем: servicePercent, participants[], dishes[]
     service_pct = Decimal(str(data.get("servicePercent", 0)))
     participants = data.get("participants", [])
     dishes = data.get("dishes", [])
-    total_overall = Decimal(str(data.get("total", 0)))
 
-    # карта id -> index и id -> name
     id_to_idx = {p["id"]: i for i, p in enumerate(participants) if "id" in p}
-    id_to_name = {p["id"]: p.get("name", f"Участник {i+1}") for i, p in enumerate(participants) if "id" in p}
 
     per_base = [Decimal(0) for _ in participants]
     base_total = Decimal(0)
@@ -438,7 +469,6 @@ def _format_webapp_message(data: dict) -> str:
         base_total += total_price
         for a in assignments:
             if a is None:
-                # нераспределённое — игнорируем (или можно делить поровну)
                 continue
             idx = id_to_idx.get(a)
             if idx is not None:
@@ -467,10 +497,6 @@ def _format_webapp_message(data: dict) -> str:
     return "\n".join(lines)
 
 async def on_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Обрабатываем данные, которые пришли из WebApp через Telegram.WebApp.sendData(JSON).
-    Эти данные автоматически привязаны к текущему пользователю: сообщение уходит в тот же чат.
-    """
     wad = update.message.web_app_data  # type: ignore[attr-defined]
     if not wad:
         return
@@ -490,7 +516,6 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    # важный хэндлер: получает данные из WebApp
     app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_web_app_data))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CallbackQueryHandler(on_callback))
