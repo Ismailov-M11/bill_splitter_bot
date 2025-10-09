@@ -25,7 +25,7 @@ from telegram.ext import (
 )
 
 # ================== CONFIG & LOGGING ==================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8388611917:AAEL-NwaqhEBlQFT_waK5iwy3ehiydBZgbU")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TOKEN_HERE")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://bill-splitter-bot.netlify.app/")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -37,6 +37,7 @@ log = logging.getLogger("bill_splitter")
 
 UZS = "UZS"
 Q3 = Decimal("0.001")  # округление до тысячных
+Q2 = Decimal("0.01")
 
 # ================== DATA MODELS ==================
 @dataclass
@@ -50,10 +51,9 @@ class Dish:
     def unit_price(self) -> Decimal:
         if self.qty_total == 0:
             return Decimal(0)
-        return self.line_total / self.qty_total   # точная цена за 1 шт
+        return (self.line_total / self.qty_total).quantize(Q3, rounding=ROUND_HALF_UP)
 
-    @property
-    def qty_left(self) -> Decimal:
+    def remaining(self) -> Decimal:
         return (self.qty_total - sum(self.assigned)).quantize(Q3)
 
 @dataclass
@@ -68,7 +68,7 @@ class Bill:
             if need > 0:
                 d.assigned.extend([Decimal(0)] * need)
 
-# чат -> состояние (для режима через меню бота)
+# чат -> состояние (для режима «меню» бота)
 STATE: Dict[int, Bill] = {}
 
 # ================== HELPERS ==================
@@ -85,31 +85,28 @@ def kb_main():
             [KeyboardButton("🧮 Open (WebApp)", web_app=WebAppInfo(url=WEBAPP_URL))],
         ],
         resize_keyboard=True,
+        one_time_keyboard=False,
     )
 
-def parse_dish_freeform(text: str) -> Tuple[str, Decimal, Decimal]:
+def parse_dish_line(text: str) -> Tuple[str, Decimal, Decimal]:
     """
-    Поддерживает:
-      1) '(название) (N) шт (цена_за_всю_позицию)' -> qty=N, line_total=цена_позиции
-      2) '(название) (цена_позиции)'               -> qty=1
+    Поддерживаем два формата:
+    1) «ассорти 2 шт 28000»
+    2) «плов 45000»  (количество = 1)
     """
-    t = text.strip()
-
-    m = re.search(
-        r"^(?P<name>.+?)\s+(?P<qty>\d+(?:[.,]\d+)?)\s*шт(?:ук)?\s+(?P<price>\d[\d\s]*)$",
-        t, re.IGNORECASE
-    )
+    s = text.strip()
+    m = re.search(r"(.*)\s+(\d+(?:[.,]\d+)?)\s*шт\s+(\d+(?:[.,]\d+)?)\s*$", s, flags=re.I)
     if m:
-        name = m.group("name").strip()
-        qty = Decimal(m.group("qty").replace(",", "."))
-        line_total = Decimal(m.group("price").replace(" ", ""))
+        name = m.group(1).strip()
+        qty = Decimal(m.group(2).replace(",", "."))
+        line_total = Decimal(m.group(3).replace(",", "."))
         return name, qty, line_total
 
-    m = re.search(r"^(?P<name>.+?)\s+(?P<price>\d[\d\s]*)$", t)
+    m = re.search(r"^(.*)\s+(\d+(?:[.,]\d+)?)\s*$", s)
     if m:
-        name = m.group("name").strip()
-        qty = Decimal("1")
-        line_total = Decimal(m.group("price").replace(" ", ""))
+        name = m.group(1).strip()
+        qty = Decimal(1)
+        line_total = Decimal(m.group(2).replace(",", "."))
         return name, qty, line_total
 
     raise ValueError("Не удалось распознать блюдо. Формат: (название) (количество) шт (цена) — либо (название) (цена).")
@@ -141,39 +138,76 @@ def build_assign_keyboard(bill: Bill, p_idx: int) -> InlineKeyboardMarkup:
         # формат: «Чойхона комплект (1/2) ✅»
         label = f"{d.name} ({left_i}/{qty_i}){mark}"
         rows.append([InlineKeyboardButton(label, callback_data=f"plus:{p_idx}:{i}")])
-    rows.append([InlineKeyboardButton("🔄 Очистить выбор", callback_data=f"clear_person:{p_idx}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_people")])
+
+    rows.append([
+        InlineKeyboardButton("🔄 Очистить выбор", callback_data=f"clear:{p_idx}"),
+    ])
+    rows.append([
+        InlineKeyboardButton("⬅️ Назад", callback_data="back_people"),
+    ])
     return InlineKeyboardMarkup(rows)
 
 def summarize_choices_for_person(bill: Bill, p_idx: int) -> str:
-    parts = []
+    lines = []
     for d in bill.dishes:
-        if d.assigned and d.assigned[p_idx] > 0:
-            parts.append(f"• {d.name} × {int(d.assigned[p_idx])}")
-    return "\n".join(parts) if parts else "—"
+        if d.assigned[p_idx] > 0:
+            unit = d.unit_price
+            qty = int(d.assigned[p_idx])
+            lines.append(f"• {d.name}: {qty} шт × {fmt_money(int(unit))} {UZS}")
+    if not lines:
+        return "—"
+    return "\n".join(lines)
 
-# ================== COMMANDS ==================
+# ================== COMMANDS / MENU ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id not in STATE:
+        STATE[chat_id] = Bill()
     await update.message.reply_text(
-        "👋 Добро пожаловать! Вы можете ввести счёт вручную или открыть WebApp (кнопка ниже).",
-        reply_markup=kb_main()
+        "Добро пожаловать! Используйте кнопки ниже.\n"
+        "Для работы с мини-приложением нажмите «🧮 Open (WebApp)».",
+        reply_markup=kb_main(),
     )
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    text = (update.message.text or "").strip()
     bill = STATE.setdefault(chat_id, Bill())
+    text = (update.message.text or "").strip()
 
     if text == "🧾 Новый счёт":
         STATE[chat_id] = Bill()
-        await update.message.reply_text("🧾 Создан новый счёт.", reply_markup=kb_main())
+        await update.message.reply_text("Новый счёт начат. Добавьте блюда и участников.", reply_markup=kb_main())
+        return
+
+    if text == "⚙️ Сервис":
+        context.user_data["mode"] = "svc"
+        await update.message.reply_text(
+            "Введите процент сервиса (целое число):",
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Отмена")]], resize_keyboard=True),
+        )
+        return
+
+    if context.user_data.get("mode") == "svc":
+        if text == "Отмена":
+            context.user_data.pop("mode", None)
+            await update.message.reply_text("Отменено.", reply_markup=kb_main())
+            return
+        try:
+            pct = int(text)
+            pct = max(0, min(100, pct))
+        except Exception:
+            await update.message.reply_text("Только число от 0 до 100, пожалуйста.")
+            return
+        bill.service_pct = Decimal(pct)
+        context.user_data.pop("mode", None)
+        await update.message.reply_text(f"Процент сервиса установлен: {pct}%", reply_markup=kb_main())
         return
 
     if text == "➕ Блюдо":
         context.user_data["mode"] = "add_dish"
         await update.message.reply_text(
-            "🍽 Введите название блюда.\n"
-            "Можно сразу так: (название блюда) (количество) шт (цена).",
+            "Пожалуйста, введите позицию. Можно сразу так: (название) (количество) шт (сумма)\n"
+            "Либо: (название) (сумма)",
             reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Отмена")]], resize_keyboard=True),
         )
         return
@@ -181,28 +215,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("mode") == "add_dish":
         if text == "Отмена":
             context.user_data.pop("mode", None)
-            await update.message.reply_text("Действие отменено.", reply_markup=kb_main())
+            await update.message.reply_text("Добавление отменено.", reply_markup=kb_main())
             return
         try:
-            name, qty, line_total = parse_dish_freeform(text)
-        except ValueError as e:
+            name, qty, line_total = parse_dish_line(text)
+        except Exception as e:
             await update.message.reply_text(str(e))
             return
         d = Dish(name=name, qty_total=qty, line_total=line_total)
         d.assigned = [Decimal(0)] * len(bill.people)
         bill.dishes.append(d)
-        context.user_data.pop("mode", None)
 
-        # 👉 Формируем список с суммами: «qty × unit = line_total»
-        def unit_i(x: Dish) -> int:
-            return int(x.unit_price.to_integral_value(rounding=ROUND_HALF_UP))
-
-        items = "\n".join(
-            f"{i+1}. {x.name} — {int(x.qty_total)} шт × {fmt_money(unit_i(x))} {UZS} = {fmt_money(int(x.line_total))} {UZS}"
-            for i, x in enumerate(bill.dishes)
-        )
+        items = "\n".join([f"{i+1}. {x.name} — {int(x.qty_total)} шт" for i, x in enumerate(bill.dishes)])
         await update.message.reply_text(
-            f"✅ Блюдо добавлено: {d.name} — {int(d.qty_total)} шт × {fmt_money(unit_i(d))} {UZS} = {fmt_money(int(d.line_total))} {UZS}\n"
+            f"✅ Блюдо добавлено: {name} — {int(qty)} шт\n\n"
             f"📋 Список блюд:\n{items}",
             reply_markup=kb_main()
         )
@@ -237,71 +263,77 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "🍽 Назначить":
         if not bill.people or not bill.dishes:
-            await update.message.reply_text("Пожалуйста, добавьте хотя бы одно блюдо и одного участника.", reply_markup=kb_main())
+            await update.message.reply_text("Сначала добавьте блюда и участников.", reply_markup=kb_main())
             return
-        await update.message.reply_text("Выберите участника:", reply_markup=build_people_keyboard(bill))
-        return
-
-    if text == "⚙️ Сервис":
-        context.user_data["mode"] = "set_service"
-        await update.message.reply_text(
-            f"Текущий сервис: {bill.service_pct}%.\nВведите новое значение от 0 до 30 или нажмите «Отмена».",
-            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Отмена")]], resize_keyboard=True),
-        )
-        return
-
-    if context.user_data.get("mode") == "set_service":
-        if text == "Отмена":
-            context.user_data.pop("mode", None)
-            await update.message.reply_text("Действие отменено.", reply_markup=kb_main())
-            return
-        try:
-            p = Decimal(text)
-            if p < 0 or p > 30:
-                raise ValueError
-        except Exception:
-            await update.message.reply_text("Введите число от 0 до 30 или нажмите «Отмена».")
-            return
-        bill.service_pct = p
-        context.user_data.pop("mode", None)
-        await update.message.reply_text(f"Сервис установлен: {bill.service_pct}%.", reply_markup=kb_main())
+        await update.message.reply_text("Кому назначаем? Выберите участника:", reply_markup=build_people_keyboard(bill))
         return
 
     if text == "🧮 Рассчитать":
-        await send_summary(update, bill)
+        if not bill.people or not bill.dishes:
+            await update.message.reply_text("Нужно добавить блюда и участников.", reply_markup=kb_main())
+            return
+
+        # считаем базу
+        per_base = [Decimal(0)] * len(bill.people)
+        base_total = Decimal(0)
+        for d in bill.dishes:
+            unit = d.unit_price
+            base_total += d.line_total
+            for i, cnt in enumerate(d.assigned):
+                per_base[i] += unit * cnt
+
+        svc_pct = bill.service_pct
+        per_svc = [ (b * svc_pct / Decimal(100)).quantize(Q2, rounding=ROUND_HALF_UP) for b in per_base ]
+        service_total = (base_total * svc_pct / Decimal(100)).quantize(Q2, rounding=ROUND_HALF_UP)
+
+        lines = [
+            "🧮 Итоговый расчёт:",
+            f"Без сервиса: {fmt_money(base_total)} {UZS}",
+            f"Сервис {bill.service_pct}%: {fmt_money(service_total)} {UZS}",
+            f"💰 Итого: {fmt_money(base_total + service_total)} {UZS}",
+            "",
+            "👥 Разбивка по участникам:",
+        ]
+        for i, name in enumerate(bill.people):
+            lines.append(
+                f"{i+1}. {name} — {fmt_money(per_base[i] + per_svc[i])} {UZS}  "
+                f"(до сервиса: {fmt_money(per_base[i])} {UZS}, +{fmt_money(per_svc[i])} {UZS})"
+            )
+        await update.message.reply_text("\n".join(lines), reply_markup=kb_main())
         return
 
-    await update.message.reply_text("Не удалось распознать команду. Пожалуйста, используйте кнопки ниже.", reply_markup=kb_main())
+    # по умолчанию просто показываем меню
+    await update.message.reply_text("Выберите действие ниже.", reply_markup=kb_main())
 
-# ================== CALLBACKS (меню бота) ==================
+# ================== CALLBACKS (назначение) ==================
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
-    chat_id = query.message.chat_id
+    chat_id = update.effective_chat.id
     bill = STATE.setdefault(chat_id, Bill())
-    log.debug("CALLBACK '%s'", data)
 
+    data = query.data or ""
     if data == "back_main":
-        await query.edit_message_text("Главное меню. Выберите дальнейшее действие.")
-        await query.message.reply_text("Пожалуйста, выберите действие на клавиатуре ниже.", reply_markup=kb_main())
+        await query.edit_message_text("Главное меню. Выберите действие.", reply_markup=kb_main())
         return
 
-    if data in ("back_people", "assign_back"):
-        await query.edit_message_text("Выберите участника:", reply_markup=build_people_keyboard(bill))
+    if data == "back_people":
+        await query.edit_message_text("Кому назначаем?\nВыберите участника:", reply_markup=build_people_keyboard(bill))
         return
 
     if data.startswith("pick_person:"):
-        p_idx = int(data.split(":")[1])
+        _, p_s = data.split(":")
+        p_idx = int(p_s)
         await show_assign_screen(update, bill, p_idx)
         return
 
-    if data.startswith("clear_person:"):
-        p_idx = int(data.split(":")[1])
+    if data.startswith("clear:"):
+        _, p_s = data.split(":")
+        p_idx = int(p_s)
         bill.ensure_assign_matrix()
         for d in bill.dishes:
             d.assigned[p_idx] = Decimal(0)
-        await show_assign_screen(update, bill, p_idx, flash="🧹 Выбор очищен.")
+        await show_assign_screen(update, bill, p_idx)
         return
 
     if data.startswith("plus:"):
@@ -332,86 +364,106 @@ async def show_assign_screen(update: Update, bill: Bill, p_idx: int, flash: str 
         reply_markup=build_assign_keyboard(bill, p_idx)
     )
 
-# ================== SUMMARY (для режима меню бота) ==================
-def compute_summary_details(bill: Bill):
-    n = max(1, len(bill.people))
-    per_person = [Decimal(0)] * n
+# ================== HANDLER ДАННЫХ ИЗ WEBAPP ==================
+def _format_webapp_message(data: dict) -> str:
+    """
+    Понимаем ОБА формата:
+    A) «Legacy» (который бот ждал раньше):
+       {
+         base_total, service_pct, service_total, total,
+         people: [{name, base, service, total}, ...]
+       }
+    B) «Builder WebApp» (то, что сейчас отправляет фронт):
+       {
+         type: "calculation",
+         servicePercent,
+         participants: [{id, name, amount}],   # сумма уже с сервисом
+         dishes: [{name, qty, totalPrice, assignments: [participantId|null, ...]}, ...],
+         total
+       }
+    В случае B пересчитываем базу/сервис на каждое лицо, исходя из dishes+assignments.
+    """
 
-    # назначенные порции
-    for d in bill.dishes:
-        unit = d.unit_price
-        assigned_sum = sum(d.assigned) if d.assigned else Decimal(0)
-        left = (d.qty_total - assigned_sum)
-        for i in range(n):
-            take = d.assigned[i] if i < len(d.assigned) else Decimal(0)
-            per_person[i] += (take * unit)
-        if left > 0:
-            share = (left / n)
-            for i in range(n):
-                per_person[i] += (share * unit)
+    # --- Случай A (legacy) ---
+    if "people" in data or "base_total" in data:
+        def g(key, default=0):
+            return int(data.get(key, default))
 
-    per_person_int = [int(x.quantize(Decimal("1."), rounding=ROUND_HALF_UP)) for x in per_person]
-    total_no_service = sum(per_person_int)
+        base_total   = g("base_total")
+        service_pct  = int(data.get("service_pct", 0))
+        service_total= g("service_total")
+        total        = g("total")
 
-    service_each = [
-        int((Decimal(p) * bill.service_pct / Decimal(100)).quantize(Decimal("1."), rounding=ROUND_HALF_UP))
-        for p in per_person_int
-    ]
-    service_amount_total = sum(service_each)
-    return total_no_service, service_amount_total, per_person_int, service_each
+        people = data.get("people", [])
+        lines = [
+            "🧮 Итоговый расчёт:",
+            f"Без сервиса: {fmt_money(base_total)} {UZS}",
+            f"Сервис {service_pct}%: {fmt_money(service_total)} {UZS}",
+            f"💰 Итого: {fmt_money(total)} {UZS}",
+            "",
+            "👥 Разбивка по участникам:",
+        ]
+        for idx, p in enumerate(people, start=1):
+            name    = p.get("name", f"Участник {idx}")
+            base    = int(p.get("base", 0))
+            svc     = int(p.get("service", 0))
+            p_total = int(p.get("total", base + svc))
+            lines.append(
+                f"{idx}. {name} — {fmt_money(p_total)} {UZS}  "
+                f"(до сервиса: {fmt_money(base)} {UZS}, +{fmt_money(svc)} {UZS})"
+            )
+        return "\n".join(lines)
 
-async def send_summary(update: Update, bill: Bill):
-    if not bill.people or not bill.dishes:
-        await update.message.reply_text("Пожалуйста, добавьте участников и блюда.", reply_markup=kb_main())
-        return
+    # --- Случай B (Builder WebApp) ---
+    # ожидаем: servicePercent, participants[], dishes[]
+    service_pct = Decimal(str(data.get("servicePercent", 0)))
+    participants = data.get("participants", [])
+    dishes = data.get("dishes", [])
+    total_overall = Decimal(str(data.get("total", 0)))
 
-    base_total, service_total, per_base, per_svc = compute_summary_details(bill)
+    # карта id -> index и id -> name
+    id_to_idx = {p["id"]: i for i, p in enumerate(participants) if "id" in p}
+    id_to_name = {p["id"]: p.get("name", f"Участник {i+1}") for i, p in enumerate(participants) if "id" in p}
+
+    per_base = [Decimal(0) for _ in participants]
+    base_total = Decimal(0)
+
+    for d in dishes:
+        qty = Decimal(str(d.get("qty", 0)))
+        total_price = Decimal(str(d.get("totalPrice", 0)))
+        assignments = d.get("assignments", [])
+        if qty <= 0:
+            continue
+        unit = (total_price / qty).quantize(Q3, rounding=ROUND_HALF_UP)
+        base_total += total_price
+        for a in assignments:
+            if a is None:
+                # нераспределённое — игнорируем (или можно делить поровну)
+                continue
+            idx = id_to_idx.get(a)
+            if idx is not None:
+                per_base[idx] += unit
+
+    per_svc = [(b * service_pct / Decimal(100)).quantize(Q2, rounding=ROUND_HALF_UP) for b in per_base]
+    service_total = (base_total * service_pct / Decimal(100)).quantize(Q2, rounding=ROUND_HALF_UP)
+
     lines = [
         "🧮 Итоговый расчёт:",
         f"Без сервиса: {fmt_money(base_total)} {UZS}",
-        f"Сервис {bill.service_pct}%: {fmt_money(service_total)} {UZS}",
+        f"Сервис {int(service_pct)}%: {fmt_money(service_total)} {UZS}",
         f"💰 Итого: {fmt_money(base_total + service_total)} {UZS}",
         "",
         "👥 Разбивка по участникам:",
     ]
-    for i, name in enumerate(bill.people):
+    for i, p in enumerate(participants, start=1):
+        name = p.get("name", f"Участник {i}")
+        base = int(per_base[i-1])
+        svc = int(per_svc[i-1])
+        total = base + svc
         lines.append(
-            f"{i+1}. {name} — {fmt_money(per_base[i] + per_svc[i])} {UZS}  "
-            f"(до сервиса: {fmt_money(per_base[i])} {UZS}, +{fmt_money(per_svc[i])} {UZS})"
-        )
-    await update.message.reply_text("\n".join(lines), reply_markup=kb_main())
-
-# ================== HANDLER ДАННЫХ ИЗ WEBAPP ==================
-def _format_webapp_message(data: dict) -> str:
-    """Форматируем сообщение строго по заданному шаблону."""
-    def g(key, default=0):
-        return int(data.get(key, default))
-
-    base_total   = g("base_total")
-    service_pct  = int(data.get("service_pct", 0))
-    service_total= g("service_total")
-    total        = g("total")
-
-    lines = [
-        "🧮 Итоговый расчёт:",
-        f"Без сервиса: {fmt_money(base_total)} {UZS}",
-        f"Сервис {service_pct}%: {fmt_money(service_total)} {UZS}",
-        f"💰 Итого: {fmt_money(total)} {UZS}",
-        "",
-        "👥 Разбивка по участникам:",
-    ]
-
-    people = data.get("people", [])
-    for idx, p in enumerate(people, start=1):
-        name    = p.get("name", f"Участник {idx}")
-        base    = int(p.get("base", 0))
-        svc     = int(p.get("service", 0))
-        p_total = int(p.get("total", base + svc))
-        lines.append(
-            f"{idx}. {name} — {fmt_money(p_total)} {UZS}  "
+            f"{i}. {name} — {fmt_money(total)} {UZS}  "
             f"(до сервиса: {fmt_money(base)} {UZS}, +{fmt_money(svc)} {UZS})"
         )
-
     return "\n".join(lines)
 
 async def on_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -435,11 +487,11 @@ async def on_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================== BOOT ==================
 def main():
-    # базовая логика бота (меню и web-app data) — на polling
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_web_app_data))  # из WebApp
+    # важный хэндлер: получает данные из WebApp
+    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_web_app_data))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CallbackQueryHandler(on_callback))
 
