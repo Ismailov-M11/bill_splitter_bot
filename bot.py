@@ -25,7 +25,7 @@ from telegram.ext import (
 )
 
 # ================== CONFIG & LOGGING ==================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8388611917:AAGRocL81MTfM4zQRJvcEwY8d1XJ831sTKs")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8388611917:AAGRocL81MTfM4zQRJvcEwY8d1XJ831sTKs") 
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://bill-splitter-bot.netlify.app/")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
