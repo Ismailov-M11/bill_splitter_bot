@@ -11,6 +11,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     WebAppInfo,
+    MenuButtonDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
@@ -970,8 +971,13 @@ async def on_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ================== BOOT ==================
+async def post_init(application: Application) -> None:
+    await application.bot.set_chat_menu_button(menu_button=MenuButtonDefault())
+    log.info("Menu button reset to default")
+
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_web_app_data))
