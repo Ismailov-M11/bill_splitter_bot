@@ -93,6 +93,7 @@ def kb_main() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton("🧾 Новый счёт"), KeyboardButton("➕ Блюдо"), KeyboardButton("👤 Участник")],
             [KeyboardButton("🍽 Назначить"), KeyboardButton("⚙️ Сервис"), KeyboardButton("🧮 Рассчитать")],
+            [KeyboardButton("OPEN", web_app=WebAppInfo(url=WEBAPP_URL))],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -352,7 +353,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE[chat_id] = Bill()
     await update.message.reply_text(
         "Добро пожаловать! Используйте кнопки ниже.\n"
-        "Чтобы работать в мини-приложении, нажмите «🧮 Open (WebApp)».",
+        "Чтобы работать в мини-приложении, нажмите «OPEN».",
         reply_markup=kb_main(),
     )
 
