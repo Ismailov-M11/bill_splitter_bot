@@ -11,6 +11,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     WebAppInfo,
+    MenuButtonWebApp,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
@@ -92,7 +93,6 @@ def kb_main() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton("🧾 Новый счёт"), KeyboardButton("➕ Блюдо"), KeyboardButton("👤 Участник")],
             [KeyboardButton("🍽 Назначить"), KeyboardButton("⚙️ Сервис"), KeyboardButton("🧮 Рассчитать")],
-            [KeyboardButton("🧮 Open (WebApp)", web_app=WebAppInfo(url=WEBAPP_URL))],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -970,8 +970,15 @@ async def on_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ================== BOOT ==================
+async def post_init(application: Application) -> None:
+    await application.bot.set_chat_menu_button(
+        menu_button=MenuButtonWebApp(text="OPEN", web_app=WebAppInfo(url=WEBAPP_URL))
+    )
+    log.info("Menu button set: %s", WEBAPP_URL)
+
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_web_app_data))
